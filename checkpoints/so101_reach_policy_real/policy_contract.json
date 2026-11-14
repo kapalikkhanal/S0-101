@@ -1,0 +1,61 @@
+{
+  "checkpoint": "model_9997.pt",
+  "control_hz": 50.0,
+  "frame": "robot base frame (base body origin, +x forward, +z up), metres",
+  "tcp": {
+    "body": "gripper",
+    "offset_m": [
+      -0.0079,
+      -0.000218,
+      -0.0981
+    ],
+    "note": "URDF gripper_frame_link"
+  },
+  "observation": [
+    [
+      "arm_joint_pos_rad",
+      4
+    ],
+    [
+      "arm_joint_vel_rad_s",
+      4
+    ],
+    [
+      "tcp_pos_m",
+      3
+    ],
+    [
+      "target_pos_m",
+      3
+    ],
+    [
+      "target_minus_tcp_m",
+      3
+    ],
+    [
+      "last_clipped_action",
+      4
+    ],
+    [
+      "joint_target_minus_joint_pos_rad",
+      4
+    ]
+  ],
+  "joint_order": [
+    "shoulder_pan",
+    "shoulder_lift",
+    "elbow_flex",
+    "wrist_flex"
+  ],
+  "action": {
+    "dim": 4,
+    "semantics": "joint_target += clip(a,-1,1) * scale; clamp to soft limits; clamp to q +- max_lead",
+    "scale_rad": 0.04,
+    "max_lead_rad": 0.15,
+    "soft_limit_factor": 0.9,
+    "fixed_joint_targets": {
+      "wrist_roll": 0.0,
+      "gripper": -0.15
+    }
+  }
+}

@@ -1,0 +1,56 @@
+# Credentials and workstation configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.aws/
+.codex/
+.agents/
+configs/*.json
+!configs/grasp_offsets.json
+# Numerical simulation fixtures and generic templates are source files.
+!configs/sim/
+!configs/examples/
+
+# Generated, private, and large artifacts
+.venv*/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+/build/
+/dist/
+/release/
+/data/
+/logs/
+/results/
+# Track only the two final released policies; other training outputs stay private.
+/checkpoints/*
+!/checkpoints/so101_reach_policy/
+!/checkpoints/so101_reach_policy_real/
+/checkpoints/so101_reach_policy/*
+!/checkpoints/so101_reach_policy/policy.onnx
+!/checkpoints/so101_reach_policy/policy.pt
+!/checkpoints/so101_reach_policy/policy_contract.json
+!/checkpoints/so101_reach_policy/model_5999.pt
+/checkpoints/so101_reach_policy_real/*
+!/checkpoints/so101_reach_policy_real/policy.onnx
+!/checkpoints/so101_reach_policy_real/policy.pt
+!/checkpoints/so101_reach_policy_real/policy_contract.json
+!/checkpoints/so101_reach_policy_real/model_9997.pt
+/videos/
+/trajectories/
+/wandb/
+/backups/
+*.bak*
+*.log
+MUJOCO_LOG.TXT
+*.zip
+*.tar.gz
+*.mp4
+.DS_Store
+.vscode/
+.idea/

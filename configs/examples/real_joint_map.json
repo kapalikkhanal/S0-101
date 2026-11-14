@@ -1,0 +1,32 @@
+{
+  "shoulder_pan": {
+    "sign": 1,
+    "zero_tick": 2048.0,
+    "scale": 1.0
+  },
+  "shoulder_lift": {
+    "sign": 1,
+    "zero_tick": 2048.0,
+    "scale": 1.0
+  },
+  "elbow_flex": {
+    "sign": 1,
+    "zero_tick": 2048.0,
+    "scale": 1.0
+  },
+  "wrist_flex": {
+    "sign": 1,
+    "zero_tick": 2048.0,
+    "scale": 1.0
+  },
+  "wrist_roll": {
+    "sign": 1,
+    "zero_tick": 2048.0,
+    "scale": 1.0
+  },
+  "gripper": {
+    "sign": 1,
+    "zero_tick": 2048.0,
+    "scale": 1.0
+  }
+}
