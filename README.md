@@ -100,6 +100,31 @@ hardware check - verified model recoveries are distilled back into the cache.
 Simulation uses ground-truth object detections plus rendered images, so success there
 does not validate real-camera perception. Logs/images stay under ignored `logs/`.
 
+### Imitation-learned grasps and Kalman object tracking
+
+The local grasp rung can use a small behavior-cloned model between a cache hit and the
+scripted default. It is trained only on grasps that held through a 5 cm lift in randomized
+sim scenes; an optional LLM expert labels the scenes the scripted policy fails (DAgger):
+
+```bash
+python scripts/gen_grasp_data.py --episodes 200 --seed 0                  # no LLM, no tokens
+python scripts/gen_grasp_data.py --episodes 50 --seed 1000 --expert local # optional expert pass
+python scripts/train_bc_grasp.py                                          # -> data/il/bc_grasp.json
+python scripts/eval_grasp_policy.py --episodes 40 --seed 100000           # held-out: heuristic vs BC
+```
+
+When `data/il/bc_grasp.json` exists the agent uses it automatically (`--no-bc` to disable).
+`--tracker kf` adds per-object Kalman filters (outlier gating, prediction through arm
+occlusion); the arm is then parked out of the head camera's view only when the tracker is
+not confident. Evaluate it under simulated camera noise and occlusion:
+
+```bash
+python scripts/eval_tracker.py --episodes 20 --seed 200000                # truth / noisy / hold / KF
+python scripts/ai_agent.py --sim table --object "red cube" --place "white box" \
+  --sim-noise --tracker kf --sim-clear-view                               # parks saved in the summary
+PYTHONPATH=src python3 -m pytest tests/test_tracker_bc.py -q              # numpy-only unit checks
+```
+
 For real operation, first complete [hardware setup and calibration](docs/HARDWARE.md).
 Then, in the main environment with settings loaded, select the included real-arm policy:
 

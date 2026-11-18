@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def main() -> None:
   p = argparse.ArgumentParser()
-  p.add_argument("--task", choices=["So101-Reach", "So101-Reach-Real"], default=TASK)
+  p.add_argument("--task", choices=["So101-Reach", "So101-Reach-Real", "So101-Reach-Real-NoServoDR"], default=TASK)
   p.add_argument("--seed", type=int, default=42)
   p.add_argument("--num-envs", type=int, default=4096)
   p.add_argument("--iterations", type=int, default=6000)
@@ -68,7 +68,7 @@ def main() -> None:
   ckpt = latest_checkpoint(new_runs[-1]) if new_runs else latest_checkpoint()
   tag = f"auto_{ckpt.parent.name}"
   py = sys.executable
-  subprocess.run([py, str(ROOT / "scripts/evaluate.py"), "--controllers", "native", "ik", "ik_joint", "--checkpoint", str(ckpt), "--tag", tag, "--actuator-model", "identified" if args.task.endswith("-Real") else "menagerie"], check=True)
+  subprocess.run([py, str(ROOT / "scripts/evaluate.py"), "--controllers", "native", "ik", "ik_joint", "--checkpoint", str(ckpt), "--tag", tag, "--actuator-model", "identified" if "-Real" in args.task else "menagerie"], check=True)
   subprocess.run([py, str(ROOT / "scripts/export_policy.py"), "--checkpoint", str(ckpt)], check=True)
 
 

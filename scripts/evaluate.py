@@ -104,6 +104,8 @@ def main() -> None:
   p.add_argument("--delay-steps", type=int, default=0, help="robustness: fixed action delay [20 ms steps]")
   p.add_argument("--kp-scale", type=float, default=1.0, help="robustness: servo stiffness scale")
   p.add_argument("--kv-scale", type=float, default=1.0, help="robustness: servo damping scale")
+  p.add_argument("--friction-scale", type=float, default=1.0, help="robustness: arm joint friction (stiction) scale")
+  p.add_argument("--deadband-ticks", type=float, default=0.0, help="robustness: servo dead band [ticks, 4096/rev]")
   p.add_argument("--actuator-model", choices=["menagerie", "identified"], default="menagerie",
                  help="servo model of the evaluation physics (identified = fitted on the real arm)")
   p.add_argument("--tag", default="")
@@ -117,13 +119,14 @@ def main() -> None:
   print(f"[eval] suite: {len(suite)} episodes ({len(suite) // len(INIT_FAMILIES)} targets x {INIT_FAMILIES}), "
         f"{int(suite.in_nvidia_box.sum())} in NVIDIA goal box")
 
-  perturb = Perturbation(args.delay_steps, args.kp_scale, args.kv_scale)
+  perturb = Perturbation(args.delay_steps, args.kp_scale, args.kv_scale, args.friction_scale, args.deadband_ticks)
   reports: dict[str, dict] = {}
   for ctrl in args.controllers:
     name = ctrl
     if ctrl == "nvidia":
       env = ManagerBasedRlEnv(
-        make_eval_env_cfg("nvidia", len(suite), args.nvidia_rebase, args.nvidia_actuator), device=args.device
+        make_eval_env_cfg("nvidia", len(suite), args.nvidia_rebase, args.nvidia_actuator, friction_scale=args.friction_scale),
+        device=args.device,
       )
       policy = policy_io.load_nvidia_obs_policy(args.device)
       name = f"nvidia[{args.nvidia_rebase},{args.nvidia_actuator}]"
@@ -132,7 +135,8 @@ def main() -> None:
 
       lat |= policy_io.measure_onnx_latency(DEFAULT_DIR / ONNX_FILE)
     else:
-      env = ManagerBasedRlEnv(make_eval_env_cfg("native", len(suite), actuator_model=args.actuator_model), device=args.device)
+      env = ManagerBasedRlEnv(make_eval_env_cfg("native", len(suite), actuator_model=args.actuator_model,
+                                                 friction_scale=args.friction_scale), device=args.device)
       if ctrl == "ik":
         policy = DlsIkController(env, DlsIkCfg(gain=args.ik_gain, v_max=args.ik_vmax))
         name = "dls_ik"

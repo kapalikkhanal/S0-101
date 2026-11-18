@@ -7,7 +7,9 @@ Each policy step (50 Hz):
   target  <- clip(target + delta_{t - lag}, soft joint limits)  (inward-only if outside)
   target  <- clip(target, q - max_lead, q + max_lead)
 
-and the target is sent to the servos at every physics substep. Integrating a commanded
+and the target is sent to the servos at every physics substep. An optional servo dead band
+(``deadband`` rad, evaluation robustness) sends the measured position instead whenever the
+target is within the band, so the position loop applies no torque there (STS3215 dead band). Integrating a commanded
 target (instead of adding the delta to the *measured* position) makes zero action mean
 "hold", keeps the command smooth, and maps 1:1 onto the Goal_Position register of the
 physical STS3215 servos. The ``max_lead`` clamp bounds wind-up when the arm is blocked.
@@ -45,6 +47,8 @@ class IncrementalJointPositionActionCfg(BaseActionCfg):
   command_name: str | None = "ee_target"
   """Command term holding the curriculum stage (action noise, delay). None disables."""
   max_delay_buffer: int = 4
+  deadband: float = 0.0
+  """Servo position dead band [rad]; 0 disables (training default)."""
   preserve_order: bool = True
 
   def __post_init__(self):
@@ -70,6 +74,7 @@ class IncrementalJointPositionAction(BaseAction):
     fixed_ids, fixed_names = self._entity.find_joints(tuple(cfg.fixed_targets.keys()), preserve_order=True)
     self._fixed_ids = torch.tensor(fixed_ids, device=self.device, dtype=torch.long)
     self._fixed_val = torch.tensor([cfg.fixed_targets[k] for k in fixed_names], device=self.device).expand(n, -1)
+    self.deadband = float(cfg.deadband)
 
   @property
   def joint_target(self) -> torch.Tensor:
@@ -109,7 +114,11 @@ class IncrementalJointPositionAction(BaseAction):
     self._processed_actions = target
 
   def apply_actions(self) -> None:
-    self._entity.set_joint_position_target(self._joint_target, joint_ids=self._target_ids)
+    target = self._joint_target
+    if self.deadband > 0:
+      q = self._entity.data.joint_pos[:, self._target_ids]
+      target = torch.where((target - q).abs() <= self.deadband, q, target)
+    self._entity.set_joint_position_target(target, joint_ids=self._target_ids)
     self._entity.set_joint_position_target(self._fixed_val, joint_ids=self._fixed_ids)
 
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:

@@ -77,7 +77,9 @@ def _policy_terms(noisy: bool) -> dict[str, ObservationTermCfg]:
   }
 
 
-def make_reach_env_cfg(play: bool = False, stage: int | None = None, actuator_model: str = "menagerie") -> ManagerBasedRlEnvCfg:
+def make_reach_env_cfg(
+  play: bool = False, stage: int | None = None, actuator_model: str = "menagerie", servo_dr: bool = True
+) -> ManagerBasedRlEnvCfg:
   """Training config (curriculum from stage 1) or play config (fixed stage, no noise/DR).
 
   Args:
@@ -87,13 +89,17 @@ def make_reach_env_cfg(play: bool = False, stage: int | None = None, actuator_mo
     actuator_model: "menagerie" or "identified" (servo model fitted on the real arm). With
       "identified", the robustness stages randomise servo kp/kv x[0.6, 1.6] and joint
       friction x[0.5, 2.0] around the fit.
+    servo_dr: False disables all servo randomization (kp/kv/friction stay at the model's
+      values; delay, action and observation noise are kept). Ablation: identified model
+      without randomization vs randomization without identification vs both.
   """
   stages = mdp.default_stages()
-  if actuator_model == "identified":
-    for st in stages:
-      if st.kp_scale_range != (1.0, 1.0):
-        st.kp_scale_range = (0.6, 1.6)
-        st.kv_scale_range = (0.6, 1.6)
+  for st in stages:
+    if not servo_dr:
+      st.kp_scale_range = st.kv_scale_range = (1.0, 1.0)
+    elif actuator_model == "identified" and st.kp_scale_range != (1.0, 1.0):
+      st.kp_scale_range = (0.6, 1.6)
+      st.kv_scale_range = (0.6, 1.6)
   if play:
     # Deterministic evaluation conditions: final-stage tolerance, no noise / delay / DR.
     final = stages[-1]
@@ -137,7 +143,7 @@ def make_reach_env_cfg(play: bool = False, stage: int | None = None, actuator_mo
     "reset_arm": EventTermCfg(func=mdp.reset_arm_by_stage, mode="reset", params={"command_name": CMD}),
     "servo_gains": EventTermCfg(func=mdp.randomize_servo_gains_by_stage, mode="reset", params={"command_name": CMD}),
   }
-  if actuator_model == "identified" and not play:
+  if actuator_model == "identified" and servo_dr and not play:
     events["joint_friction"] = EventTermCfg(
       func=mdp.dr.joint_friction,
       mode="reset",

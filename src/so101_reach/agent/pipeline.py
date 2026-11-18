@@ -6,7 +6,8 @@ planner call for free-text tasks such as stacking / unstacking). For each step:
   1. code   park the arm out of the head camera's view, measure the object and the target
   2. code   open the gripper to the object's width + 2 cm, rise, RL travel to 5 cm above the object
   3. local  GRASP, zero tokens: cached parameters from an earlier LLM success if the skill cache
-            has a matching scene, else the scripted default (local_skills.py). Judged by the
+            has a matching scene, else the behavior-cloned model's prediction (bc_grasp.py, if a
+            trained model is given), else the scripted default (local_skills.py). Judged by the
             holding signal. Only if that fails does the LLM run the GRASP phase (with the local
             failure as context); a verified LLM grasp is distilled back into the cache.
   4. code   lift above everything nearby, RL travel to 5 cm above the target
@@ -77,21 +78,32 @@ def _cm(v: float) -> float:
 class Pipeline:
   def __init__(self, agent, arm, per, grasp_retries: int = 2, grasp_turns: int = 10, place_turns: int = 6,
                hover_cm: float = 5.0, clear_view: bool = True, log=print,
-               cache: SkillCache | None = None, handoff: str = "local-first"):
+               cache: SkillCache | None = None, handoff: str = "local-first", bc=None):
     """handoff: "local-first" (cached/scripted fine motion first, LLM only on failure) or
-    "llm-only" (the LLM runs every grasp/place phase, the old behaviour)."""
+    "llm-only" (the LLM runs every grasp/place phase, the old behaviour).
+    bc: optional BcGrasp model; its prediction is the grasp rung between a cache hit and the
+    scripted default.
+    If `per` has a `confident(names)` method (TrackedPerception), the arm is parked out of the
+    head camera's view only when the tracker is not confident about the objects."""
     self.agent, self.arm, self.per = agent, arm, per
     self.grasp_retries, self.grasp_turns, self.place_turns = grasp_retries, grasp_turns, place_turns
     self.hover = hover_cm / 100
     self.use_clear_view = clear_view
     self.say = log
     self.tz = per.table_z
-    self.cache, self.handoff = cache, handoff
-    self.stats = {"llm_phases": 0, "local_phases": 0, "cache_hits": 0, "tokens_saved": 0}
+    self.cache, self.handoff, self.bc = cache, handoff, bc
+    self.stats = {"llm_phases": 0, "local_phases": 0, "cache_hits": 0, "bc_phases": 0, "tokens_saved": 0,
+                  "parks": 0, "parks_skipped": 0}
 
   # --- perception helpers ------------------------------------------------------------------
   def _measure(self, names: list[str]) -> dict[str, Detection]:
-    if self.use_clear_view:
+    park = self.use_clear_view
+    if park and hasattr(self.per, "confident") and self.per.confident(names):
+      park = False  # the Kalman tracker already knows where everything is: skip the ~5-8 s park
+      self.stats["parks_skipped"] += 1
+      self.say(f"  [pipeline] tracker confident about {names}: not parking the arm")
+    if park:
+      self.stats["parks"] += 1
       self.arm.clear_view()
     self.per.views()
     out = {}
@@ -99,7 +111,7 @@ class Pipeline:
       dets = self.per.find(n)
       if dets:
         out[n] = dets[0]
-    if self.use_clear_view:
+    if park:
       self.arm.home()  # leave the parking pose on its checked joint path (RL travel starts from home)
     return out
 
@@ -170,11 +182,17 @@ class Pipeline:
         return {**res, "result": r}
       gkey = make_key("grasp", pick, obj.size)
       if self.handoff == "local-first" and attempt == 0:
-        # Zero-token rung: cached parameters from an earlier LLM success, else the scripted default.
+        # Zero-token rung: cached parameters from an earlier LLM success, else the BC model's
+        # prediction, else the scripted default.
         entry = self.cache.lookup(gkey) if self.cache else None
+        params = entry["params"] if entry else (self.bc.predict(obj, self.tz) if self.bc is not None else None)
         self.agent.phase = f"s{k}_local{attempt + 1}_"
-        held, grasp_note = scripted_grasp(self.arm, obj, self.tz, entry["params"] if entry else None)
+        held, grasp_note = scripted_grasp(self.arm, obj, self.tz, params)
+        if params is not None and not entry:
+          grasp_note = grasp_note.replace("cached params", "BC prediction", 1)
         self.say(f"  [pipeline] grasp phase (local, 0 tokens): {grasp_note}")
+        if held and params is not None and not entry:
+          self.stats["bc_phases"] += 1
         if entry:
           self.cache.hit(entry, held)
           if held:
@@ -201,7 +219,11 @@ class Pipeline:
         gp = self.arm.geom(self.arm.q6()[0])["gp"]
         held_below = float(gp[2] - obj.support_z)
         self.arm.held = {"name": pick, "below_gp": held_below, "size": obj.size}
+        if hasattr(self.per, "forget"):
+          self.per.forget(pick)  # it travels with the gripper now: a stale track would fake the placement check
         break
+      if hasattr(self.per, "invalidate"):
+        self.per.invalidate(pick)  # the failed grasp may have nudged it: re-measure before retrying
       self.arm.gripper(min(80.0, self.arm.percent_for_gap(width + 0.02)), "medium")
       self._rise_to(obj.top_z + self.hover)
     if held_below is None:
@@ -260,13 +282,24 @@ class Pipeline:
       return {**res, "result": "place failed: object remains held"}
     release_gp = self.arm.geom(self.arm.q6()[0])["gp"]  # the pose that released; distilled on success
     self.arm.held = None
+    if hasattr(self.per, "invalidate"):
+      self.per.invalidate(place_on)  # the released object may have shifted the target
     self._rise_to(self.tz + self.arm.state()["grip_point_cm"][2] / 100 + 0.04)
     # Release alone does not prove placement. Refresh geometry after settling.
     self.arm.wait(0.5)
     self.per.views()
-    measured = [d for d in self.per.find(pick) if not d.extra.get("note")]
-    verified = any(np.linalg.norm(d.center[:2] - tgt.center[:2]) < max(tgt.size[:2]) / 2
-                   and d.support_z <= tgt.top_z + 0.015 for d in measured)
+    def placed_on(dets, t):
+      return any(np.linalg.norm(d.center[:2] - t.center[:2]) < max(t.size[:2]) / 2
+                 and d.support_z <= t.top_z + 0.015 for d in dets if not d.extra.get("note"))
+
+    verified = placed_on(self.per.find(pick), tgt)
+    if not verified:
+      # The arm hovers right above the drop and may hide the object, and `tgt` is the pre-place
+      # (noisy) estimate. Re-measure both from a clear view before calling the placement a failure.
+      fresh = self._measure([pick, place_on])
+      if pick in fresh:
+        verified = placed_on([fresh[pick]], fresh.get(place_on, tgt))
+      self.say(f"  [pipeline] placement re-checked from a clear view -> {'verified' if verified else 'not verified'}")
     if released_by == "cache" and entry is not None:
       self.cache.hit(entry, verified)
       if verified:
@@ -302,7 +335,8 @@ class Pipeline:
     ok = len(results) == len(steps) and all(r["result"] == "placed" for r in results)
     u = dict(self.agent.total_usage)
     self.say(f"  [pipeline] handoff {self.handoff}: {self.stats['llm_phases']} LLM phase(s), "
-             f"{self.stats['local_phases']} local ({self.stats['cache_hits']} cache hit(s)); "
+             f"{self.stats['local_phases']} local ({self.stats['cache_hits']} cache hit(s), {self.stats['bc_phases']} BC); "
+             f"camera parks {self.stats['parks']} (skipped {self.stats['parks_skipped']} by the tracker); "
              f"tokens in {u['in']:,} / out {u['out']:,}; ~{self.stats['tokens_saved']:,} tokens saved by the cache"
              + (f"; {self.cache.summary()} in {self.cache.path}" if self.cache else ""))
     return {"success": ok, "steps": results, "home": home, "wall_s": round(time.time() - t0, 1),

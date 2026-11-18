@@ -113,10 +113,23 @@ class Perturbation:
   """Fixed action delay in 20 ms policy steps (incremental-target action term only)."""
   kp_scale: float = 1.0
   kv_scale: float = 1.0
+  friction_scale: float = 1.0
+  """Arm joint frictionloss scale. Applied by the eval env's reset event (make_eval_env_cfg
+  friction_scale); recorded here so every report carries it."""
+  deadband_ticks: float = 0.0
+  """Servo position dead band [STS3215 ticks, 4096 / rev] (incremental-target action term only)."""
 
   @property
   def label(self) -> str:
-    return f"delay{self.delay_steps}_kp{self.kp_scale:g}_kv{self.kv_scale:g}"
+    s = f"delay{self.delay_steps}_kp{self.kp_scale:g}_kv{self.kv_scale:g}"
+    if self.friction_scale != 1.0:
+      s += f"_fric{self.friction_scale:g}"
+    if self.deadband_ticks:
+      s += f"_db{self.deadband_ticks:g}"
+    return s
+
+
+TICK_RAD = 2 * np.pi / 4096
 
 
 def reset_to_suite(
@@ -150,6 +163,10 @@ def reset_to_suite(
     act._delta_hist.zero_()
   elif perturb.delay_steps:
     raise ValueError("action delay is only supported by the incremental-target action term")
+  if hasattr(act, "deadband"):
+    act.deadband = perturb.deadband_ticks * TICK_RAD
+  elif perturb.deadband_ticks:
+    raise ValueError("servo dead band is only supported by the incremental-target action term")
   env.action_manager._action.zero_()
   env.action_manager._prev_action.zero_()
   cmd.set_target(torch.tensor(suite.targets, device=dev))

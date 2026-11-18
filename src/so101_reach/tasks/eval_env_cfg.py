@@ -22,7 +22,7 @@ from mjlab.managers.termination_manager import TerminationTermCfg
 from so101_reach.checkpoints.nvidia import load_contract
 from so101_reach.tasks import mdp
 from so101_reach.tasks.mdp import nvidia as nv
-from so101_reach.tasks.reach_env_cfg import ACT, CMD, PHYSICS_DT, make_reach_env_cfg
+from so101_reach.tasks.reach_env_cfg import _ARM, ACT, CMD, PHYSICS_DT, make_reach_env_cfg
 
 NVIDIA_FIXED = {"wrist_roll": 0.0, "gripper": 0.0}
 
@@ -33,6 +33,7 @@ def make_eval_env_cfg(
   nvidia_rebase: Literal["policy_step", "every_10ms"] = "policy_step",
   nvidia_actuator: Literal["menagerie", "isaac_pd"] = "menagerie",
   actuator_model: Literal["menagerie", "identified"] = "menagerie",
+  friction_scale: float = 1.0,
 ) -> ManagerBasedRlEnvCfg:
   cfg = make_reach_env_cfg(play=True, actuator_model=actuator_model)
   cfg.scene.num_envs = num_envs
@@ -46,7 +47,7 @@ def make_eval_env_cfg(
   cfg.observations["critic"] = cfg.observations["actor"]
 
   if controller == "native":
-    return cfg
+    return _scale_friction(cfg, friction_scale)
 
   c = load_contract()
   cfg.actions = {
@@ -83,5 +84,16 @@ def make_eval_env_cfg(
       func=mdp.set_servo_gains,
       mode="reset",
       params={"kp": dict(c.stiffness), "kv": dict(c.damping)},
+    )
+  return _scale_friction(cfg, friction_scale)
+
+
+def _scale_friction(cfg: ManagerBasedRlEnvCfg, scale: float) -> ManagerBasedRlEnvCfg:
+  """Deterministic scale of the arm joints' frictionloss (relative to the compiled model)."""
+  if scale != 1.0:
+    cfg.events["joint_friction"] = EventTermCfg(
+      func=mdp.dr.joint_friction,
+      mode="reset",
+      params={"asset_cfg": _ARM, "ranges": (scale, scale), "operation": "scale"},
     )
   return cfg

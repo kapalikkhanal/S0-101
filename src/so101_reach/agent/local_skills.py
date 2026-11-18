@@ -34,15 +34,32 @@ def _wrap_deg(a: float) -> float:
   return (a + 90.0) % 180.0 - 90.0
 
 
+ELONGATED_RATIO = 1.3  # footprint longer than this x its width: grip across the narrow side only
+
+
+def square_footprint(l: float, w: float) -> bool:
+  """True when the jaws can grip across either face pair (square / round footprint): jaw angles
+  0 and 90 deg relative to the object are then equivalent."""
+  return max(l, w) <= ELONGATED_RATIO * min(l, w)
+
+
+def fold_jaw_rel(jaw_rel: float, l: float, w: float) -> float:
+  """Canonical object-relative jaw angle: [-45, 45) for a square / round footprint (period 90),
+  else [-90, 90) (period 180). Used to make BC labels single-valued."""
+  return (jaw_rel + 45.0) % 90.0 - 45.0 if square_footprint(l, w) else _wrap_deg(jaw_rel)
+
+
+def _nearest_turn(now: float, cands: list[float]) -> float:
+  return min(cands, key=lambda c: abs((c - now + 90) % 180 - 90))
+
+
 def jaw_for(arm, obj, width: float) -> float:
   """Jaw closing direction square to the object's faces: across the narrow side of an elongated
   object; for a square / round one, whichever face direction needs the smaller wrist turn
   (closing diagonally on a square block catches only its corners and it slips out)."""
-  if max(obj.size[:2]) > 1.3 * width:
+  if max(obj.size[:2]) > ELONGATED_RATIO * width:
     return obj.yaw_deg + 90
-  now = arm.state()["jaw_yaw_deg"]
-  cands = [obj.yaw_deg, obj.yaw_deg + 90]
-  return min(cands, key=lambda c: abs((c - now + 90) % 180 - 90))
+  return _nearest_turn(arm.state()["jaw_yaw_deg"], [obj.yaw_deg, obj.yaw_deg + 90])
 
 
 def heuristic_grasp_params(arm, obj, tz: float) -> dict:
@@ -94,6 +111,8 @@ def scripted_grasp(arm, obj, tz: float, params: dict | None = None) -> tuple[boo
     x, y = obj.center[0] + params["dxy_obj_mm"][0] / 1000, obj.center[1] + params["dxy_obj_mm"][1] / 1000
     h = obj.top_z + params["h_rel_top_mm"] / 1000
     jaw = obj.yaw_deg + params.get("jaw_rel_deg", 0.0)
+    if square_footprint(*(float(v) for v in obj.size[:2])):
+      jaw = _nearest_turn(arm.state()["jaw_yaw_deg"], [jaw, jaw + 90])  # 0 / 90 equivalent: turn less
     force = params.get("force", "firm")
   else:
     x, y = obj.center[0], obj.center[1]

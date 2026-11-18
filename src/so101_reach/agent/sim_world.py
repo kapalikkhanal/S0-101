@@ -183,7 +183,19 @@ class SimWorld:
       self._renderers[cam] = mujoco.Renderer(self.model, h, w)
     r = self._renderers[cam]
     r.update_scene(self.data, camera=cam)
+    if cam == "wrist":
+      self.hide_wrist_housing(r.scene)
     return cv2.cvtColor(r.render(), cv2.COLOR_RGB2BGR)
+
+  def hide_wrist_housing(self, scn: mujoco.MjvScene) -> None:
+    """Drop the camera_mount geoms from a wrist-camera render. The calibrated D405 optical centre
+    lies ~2.6 cm inside the mount mesh, so without this the wrist image is the inside of its own
+    housing; the real lens looks out of the housing's front. Rendering only, physics unchanged."""
+    mount = self.model.body("camera_mount").id
+    for i in range(scn.ngeom):
+      g = scn.geoms[i]
+      if g.objtype == mujoco.mjtObj.mjOBJ_GEOM and self.model.geom_bodyid[g.objid] == mount:
+        g.rgba[3] = 0.0
 
   def camera_model(self, cam: str) -> tuple[np.ndarray, np.ndarray, float, float, float, float]:
     """(R_base_cam (OpenCV axes), t_base_cam, fx, fy, cx, cy) of a camera right now."""

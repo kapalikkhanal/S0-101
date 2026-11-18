@@ -19,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 
-from so101_reach.agent.local_skills import is_soft
+from so101_reach.agent.local_skills import fold_jaw_rel, is_soft
 
 DEFAULT_MODEL = Path(__file__).resolve().parents[3] / "data" / "il" / "bc_grasp.json"
 FORCE_CLASSES = ("gentle", "medium", "firm")
@@ -75,5 +75,5 @@ class BcGrasp:
     jaw = float(np.degrees(np.arctan2(y[3], y[4])) / 2.0)
     return {"dxy_obj_mm": [round(float(y[0]), 1), round(float(y[1]), 1)],
             "h_rel_top_mm": round(float(y[2]), 1),
-            "jaw_rel_deg": round((jaw + 90.0) % 180.0 - 90.0, 1),
+            "jaw_rel_deg": round(fold_jaw_rel(jaw, float(obj.size[0]), float(obj.size[1])), 1),
             "force": FORCE_CLASSES[int(np.argmax(y[5:8]))]}

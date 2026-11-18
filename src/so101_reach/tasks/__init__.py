@@ -5,6 +5,9 @@ Tasks:
   So101-Reach-Real   same task with the servo model identified on the real arm
                      (configs/servo_model_fit.json) + randomisation around it; used to
                      fine-tune the policy for hardware
+  So101-Reach-Real-NoServoDR
+                     identified servo model WITHOUT servo randomization (kp/kv/friction
+                     fixed at the fit); sim-to-real ablation baseline
 
 The nvidia/so101-reach adapter is an evaluation-only environment
 (``so101_reach.tasks.eval_env_cfg.make_eval_env_cfg(controller="nvidia")``) because the
@@ -28,6 +31,14 @@ register_mjlab_task(
 register_mjlab_task(
   task_id="So101-Reach-Real",
   env_cfg=make_reach_env_cfg(actuator_model="identified"),
+  play_env_cfg=make_reach_env_cfg(play=True, actuator_model="identified"),
+  rl_cfg=so101_reach_ppo_runner_cfg(),
+  runner_cls=So101ReachRunner,
+)
+
+register_mjlab_task(
+  task_id="So101-Reach-Real-NoServoDR",
+  env_cfg=make_reach_env_cfg(actuator_model="identified", servo_dr=False),
   play_env_cfg=make_reach_env_cfg(play=True, actuator_model="identified"),
   rl_cfg=so101_reach_ppo_runner_cfg(),
   runner_cls=So101ReachRunner,

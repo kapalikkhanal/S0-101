@@ -13,7 +13,13 @@ Two modes:
   python scripts/agent_pick.py --task "stack the red cube on the white cube" --track "red cube" "white cube"
 
 Options: --model (default gpt-5.5; e.g. gpt-6-luna, gpt-5.4-mini), --effort low|medium|high,
---max-turns, --speed (RL travel speed 0.05-1). The key is read from OPENAI_API_KEY or
+--max-turns, --speed (RL travel speed 0.05-1).
+Local grasp rung: a trained BC model (data/il/bc_grasp.json, scripts/train_bc_grasp.py) is used
+between a skill-cache hit and the scripted default; --no-bc disables it.
+Perception: --tracker kf wraps perception in per-object Kalman filters (src/so101_reach/agent/tracker.py);
+the arm is then parked out of the head camera's view only when the tracker is not confident.
+In sim, --sim-noise adds camera-like noise / outliers / arm occlusion and --sim-clear-view parks
+the arm like on the real robot (to measure the parks the tracker saves). The key is read from OPENAI_API_KEY or
 .env.local (OPENAI_KEY=...). Logs (images, calls, timing, tokens): logs/agent/<time>/.
 On the real arm the arm holds its pose at the end (scripts/real_release.py lets it go limp).
 """
@@ -46,7 +52,27 @@ def run_task(args, agent, arm, per, task: str, track: list[str], clear_view: boo
 
   cache = None if args.no_cache else (SkillCache(args.cache_dir) if args.cache_dir else SkillCache())
   steps = [{"pick": args.object, "place_on": args.place}] if (args.object and args.place and not args.task) else None
-  return Pipeline(agent, arm, per, clear_view=clear_view, cache=cache, handoff=args.handoff).run(task, track, steps)
+  return Pipeline(agent, arm, per, clear_view=clear_view, cache=cache, handoff=args.handoff,
+                  bc=load_bc(args)).run(task, track, steps)
+
+
+def load_bc(args):
+  if args.no_bc or args.handoff != "local-first":
+    return None
+  from so101_reach.agent.bc_grasp import BcGrasp
+
+  bc = BcGrasp.load(args.bc_model)
+  print(f"[agent] BC grasp model: {args.bc_model if bc is not None else 'none (' + str(args.bc_model) + ' missing)'}")
+  return bc
+
+
+def wrap_perception(args, per, track: list[str], arm_points=None):
+  if args.tracker == "kf":
+    from so101_reach.agent.tracker import TrackedPerception
+
+    print("[agent] perception: Kalman object tracker")
+    return TrackedPerception(per, track, arm_points=arm_points)
+  return per
 
 
 def main() -> None:
@@ -77,8 +103,18 @@ def main() -> None:
   p.add_argument("--no-cache", action="store_true", help="pipeline mode: do not read or write the skill cache")
   p.add_argument("--cache-dir", type=Path, default=None,
                  help="skill-cache directory (default: data/agent_cache)")
+  p.add_argument("--bc-model", type=Path, default=None, help="BC grasp model (default: data/il/bc_grasp.json if present)")
+  p.add_argument("--no-bc", action="store_true", help="do not use the BC grasp model")
+  p.add_argument("--tracker", default="none", choices=["none", "kf"], help="kf: Kalman object tracking (fewer camera parks)")
+  p.add_argument("--sim-noise", action="store_true", help="sim: camera-like measurement noise, outliers and arm occlusion")
+  p.add_argument("--noise-seed", type=int, default=0)
+  p.add_argument("--sim-clear-view", action="store_true", help="sim: park the arm out of view before measuring, like the real arm")
   p.add_argument("--yes", action="store_true", help="real arm: start without asking")
   args = p.parse_args()
+  if args.bc_model is None:
+    from so101_reach.agent.bc_grasp import DEFAULT_MODEL
+
+    args.bc_model = DEFAULT_MODEL
   if args.task is None and args.object is None:
     p.error("give --object (and optionally --place) or --task")
   task = args.task or (f"Pick up the {args.object}" + (f" and put it into the {args.place}" if args.place else " and lift it about 5 cm")
@@ -104,10 +140,16 @@ def main() -> None:
     for _ in range(25):
       plant.wait()
     arm = AgentArm(plant, ctrl, SafeTargets(), world.cfg.table_z)
-    agent = Agent(arm, SimPerception(world), args.model, args.effort, args.max_turns, base_url=args.base_url,
+    per = SimPerception(world)
+    if args.sim_noise:
+      from so101_reach.agent.sim_noise import NoisyPerception
+
+      per = NoisyPerception(per, arm_points=arm.arm_points, seed=args.noise_seed)
+    per = wrap_perception(args, per, track, arm_points=arm.arm_points)
+    agent = Agent(arm, per, args.model, args.effort, args.max_turns, base_url=args.base_url,
                   head_width=args.head_width, wrist_width=args.wrist_width, detail=args.detail, max_input_tokens=args.max_input_tokens)
     print(f"[agent] SIM {args.sim}: {task}  (model {args.model}, effort {args.effort}); log {agent.log_dir}")
-    res = run_task(args, agent, arm, agent.per, task, track, clear_view=False)
+    res = run_task(args, agent, arm, agent.per, task, track, clear_view=args.sim_clear_view)
     print(f"[agent] result: {res}")
     if args.object and args.place:
       truth = [s for s in world.surfaces() if args.place in s["label"] or s["label"] in args.place]
@@ -153,6 +195,7 @@ def main() -> None:
       wrist.warmup(1.0)
       wpose = WristCameraPose(WristCameraCalibration.load(), joints)
     per = RealPerception(head, wrist, hcal, wpose, table_z, arm_points=lambda: holder["arm"].arm_points() if "arm" in holder else None)
+    per = wrap_perception(args, per, track)
     bus = stack.enter_context(FeetechBus(FOLLOWER_PORT, calib=fcal))
     plant = RealPlant(bus, jmap, fcal, torque_limit=400)
     if not args.yes:

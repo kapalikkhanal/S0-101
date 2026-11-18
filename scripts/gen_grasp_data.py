@@ -115,7 +115,7 @@ def _approach(arm, per, label):
   if width > 0.065:
     return None  # wider than the jaws can open
   arm.gripper(min(80.0, arm.percent_for_gap(width + 0.02)), "medium")
-  if not _rise_to(max(obj.top_z + 0.03, TZ + arm.state()["grip_point_cm"][2] / 100)):
+  if not _rise_to(arm, max(obj.top_z + 0.03, TZ + arm.state()["grip_point_cm"][2] / 100)):
     return None
   jaw = jaw_for(arm, obj, width)
   h_cm = _cm(obj.top_z + HOVER - TZ)
@@ -172,12 +172,16 @@ def run_episode(ep: int, seed: int, ctrl, bc, args, make_agent) -> list[dict]:
         rows.append(row(source, obj0, params, False, "object lost after a failed attempt"))
         return rows
       ok, note = scripted_grasp(arm, obj, TZ, params)
+      # Label = the COMMANDED params (what replay executes). The achieved pose differs by the arm's
+      # tracking error; replaying it as a command would add that error a second time. It is kept
+      # as "achieved" for analysis, distilled now while closed (_lift_verified raises it 5 cm).
+      achieved = distill_grasp(arm, obj, params["force"]) if ok else None
       ok = ok and _lift_verified(arm)
-      rows.append(row(source, obj, distill_grasp(arm, obj, params["force"]) if ok else params, ok, note))
+      rows.append({**row(source, obj, params, ok, note), "achieved": achieved if ok else None})
       if ok:
         return rows
       arm.gripper(min(80.0, arm.percent_for_gap(float(min(obj.size[:2])) + 0.02)), "medium")
-      _rise_to(obj.top_z + HOVER)
+      _rise_to(arm, obj.top_z + HOVER)
     if make_agent is not None:
       obj = _approach(arm, per, label)
       if obj is None:
@@ -185,8 +189,9 @@ def run_episode(ep: int, seed: int, ctrl, bc, args, make_agent) -> list[dict]:
         return rows
       agent = make_agent(arm, per)
       out = _expert_grasp(agent, arm, obj, rows[-1]["note"])
+      p = distill_grasp(arm, obj, agent.last_close_force)  # before the 5 cm verification lift
       ok = _lift_verified(arm)
-      p = distill_grasp(arm, obj, agent.last_close_force) if ok else {}
+      p = p if ok else {}
       rows.append({**row("expert", obj, p, ok, out.get("summary", "")),
                    "tokens": out.get("input_tokens", 0) + out.get("output_tokens", 0)})
   finally:
