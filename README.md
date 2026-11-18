@@ -16,6 +16,52 @@ end-to-end RL for manipulation. OpenAI execution sends scene images and task/sta
 to the API and incurs usage charges. The local LLM alternatives are experimental:
 they can work, but are inconsistent and not fully validated.
 
+## What's new
+
+- **Local-first grasp/place handoff.** In `--mode pipeline`, grasp and place first run locally
+  for zero tokens: a cached skill, then the learned grasp, then a scripted default. The model
+  is called only when the local attempt fails its check. Verified model recoveries are written
+  back to the cache. See [Run the AI agent](#run-the-ai-agent).
+- **Learned grasp (behavior cloning).** A small model trained only on sim grasps that held
+  through a 5 cm lift. No LLM tokens are needed to train it. On 40 held-out scenes it succeeded
+  on the first try 30/40 times, against 28/40 for the scripted grasp. The gain is largest on bars
+  and stacked objects. See [Imitation-learned grasps](#imitation-learned-grasps-and-kalman-object-tracking).
+- **Kalman object tracker** (`--tracker kf`). Under simulated camera noise, outliers and arm
+  occlusion, the median position error falls from 6.5 mm to 3.1 mm (3-frame hold vs. Kalman).
+  The tracker still has a position estimate 93% of the time while the arm blocks the camera. The
+  arm now parks out of view only when the tracker is not confident.
+- **Sim-to-reality noise model** (`src/so101_reach/agent/sim_reality.py`). One `level` knob
+  (0 = exact sim, 1 = realistic, 2 = pessimistic) scales servo encoder noise and calibration
+  bias, actuator friction and deadband, object mass and friction, and camera noise and
+  extrinsic offset. `scripts/evaluate.py` also gained `--friction-scale` and `--deadband-ticks`
+  for reach-robustness ablations.
+- **Wrist-camera fix.** The sim wrist camera was rendering the inside of its own mount, so sim
+  wrist images taken before this fix were unusable. `SimWorld.render` now hides the housing.
+- **Demo videos.** `scripts/record_sim_reality.py` records the local pipeline in the noisy sim,
+  with head- and wrist-camera insets. Add `--tracker` to overlay the Kalman estimates.
+- **Report experiments.** `scripts/report/t01…t08_*.py` cover manipulation methods, the noise
+  sweep, the reach benchmark, reach sim-to-real, VLM latency, language generalization, BC data
+  efficiency and PPO training. `bash scripts/report/run_all.sh` runs them (`SMALL=1` gives a
+  quick pass), and `scripts/report/plot_all.py` writes the figures to `results/report/figures/`.
+
+### Results so far
+
+These come from the quick `SMALL=1` pass, with 5–10 episodes per cell, so the confidence
+intervals are wide. The VLA/LLM runs, latency, language and PPO curves have not been run yet.
+
+| Kalman tracker vs raw perception | Learned vs scripted grasp (held-out) |
+|---|---|
+| ![Kalman tracker](docs/figures/19_tracker.png) | ![BC vs scripted](docs/figures/20_bc_vs_scripted.png) |
+| **BC data efficiency** | **Pick-and-place success, exact vs realistic noise** |
+| ![BC data efficiency](docs/figures/11_bc_data_efficiency.png) | ![Success by method](docs/figures/01_success_by_method.png) |
+
+![Robustness to noise level](docs/figures/06_robustness_noise.png)
+
+In the full pick-and-place task, the learned grasp held up better under realistic noise than the
+scripted one: 60% vs 30% success (n = 10 each). In exact sim the two are similar (70% vs 80%).
+The figures are copies from `results/report/figures/`, which Git ignores. Re-run
+`plot_all.py` and copy them again to update the figures here.
+
 ## Start from a clone
 
 Use Linux with Python 3.12 and `uv`. PPO training and the MjLab interactive viewer need

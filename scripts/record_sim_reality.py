@@ -12,7 +12,9 @@ an inset of the wrist (gripper) camera, and a caption with the current pipeline 
 
   .venv/bin/python scripts/record_sim_reality.py                         # level 1 -> videos/sim_reality_l1.mp4
   .venv/bin/python scripts/record_sim_reality.py --level 2 --seed 3
-  .venv/bin/python scripts/record_sim_reality.py --steps "red cube>white cube" "black cube>white box"
+  .venv/bin/python scripts/record_sim_reality.py --tracker               # + Kalman tracker -> ..._kf.mp4
+  .venv/bin/python scripts/record_sim_reality.py --steps "red cube>white cube"   # stack instead of the default
+                                                                           # (every cube into the white box)
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ from so101_reach.agent.perception import SimPerception  # noqa: E402
 from so101_reach.agent.pipeline import Pipeline  # noqa: E402
 from so101_reach.agent.sim_reality import make_world, wrap_perception  # noqa: E402
 from so101_reach.agent.sim_world import scene  # noqa: E402
+from so101_reach.agent.tracker import TrackedPerception  # noqa: E402
 from so101_reach.real.controller import ControllerCfg, ReachController  # noqa: E402
 from so101_reach.real.mouse_real import SafeTargets  # noqa: E402
 from so101_reach.real.robot import SimRealPlant  # noqa: E402
@@ -163,7 +166,15 @@ class Recorder:
             cv2.line(inset, pt, pm, col, 1, cv2.LINE_AA)
       elif pt:
         cv2.drawMarker(inset, pt, (160, 160, 160), cv2.MARKER_TILTED_CROSS, 14, 2, cv2.LINE_AA)
-    self._paste(img, inset, W - INSET_W - 16, "head camera (zoom)   o truth   + noisy measurement")
+    if isinstance(self.per, TrackedPerception):  # the Kalman estimate of every tracked object
+      for nt in self.per.names.values():
+        for tr in nt.tracks:
+          pk = self._project_head(tr.x[:3])
+          if pk:
+            cv2.drawMarker(inset, pk, (230, 160, 40), cv2.MARKER_DIAMOND, 16, 2, cv2.LINE_AA)
+    legend = "o truth  + noisy meas.  <> Kalman" if isinstance(self.per, TrackedPerception) else \
+        "head camera (zoom)   o truth   + noisy measurement"
+    self._paste(img, inset, W - INSET_W - 16, ("head cam  " if "Kalman" in legend else "") + legend)
     self._paste(img, self._render(self.wrist, "wrist"), 16, "wrist camera (on the gripper)")
     band = img[:92].copy()
     cv2.rectangle(band, (0, 0), (W, 92), (20, 20, 20), -1)
@@ -201,11 +212,13 @@ def main() -> None:
   p.add_argument("--level", type=float, default=1.0, help="reality-gap level: 0 exact sim, 1 realistic, 2 pessimistic")
   p.add_argument("--seed", type=int, default=0, help="noise realisation")
   p.add_argument("--scene", default="stack", choices=["stack", "tower", "table", "on_box"])
-  p.add_argument("--steps", nargs="+", default=["red cube>white cube", "black cube>white box"],
+  p.add_argument("--steps", nargs="+", default=["red cube>white box", "black cube>white box", "white cube>white box"],
                  help='pick-and-place steps "object>target"')
   p.add_argument("--speed", type=float, default=0.5, help="RL travel speed 0.05-1")
   p.add_argument("--fps", type=int, default=30)
   p.add_argument("--playback", type=float, default=1.5, help="video speed vs. sim time (1 = real time)")
+  p.add_argument("--tracker", action="store_true",
+                 help="Kalman object tracker on top of the noisy perception: the arm parks only when it is unsure")
   p.add_argument("--no-clear-view", action="store_true", help="do not park the arm out of view before measuring")
   p.add_argument("--view", type=float, nargs=3, default=(0.66, 225.0, -30.0), metavar=("DIST", "AZIM", "ELEV"),
                  help="overview camera")
@@ -217,7 +230,7 @@ def main() -> None:
 
   steps = [dict(zip(("pick", "place_on"), (s.strip() for s in st.split(">")), strict=True)) for st in args.steps]
   names = list(dict.fromkeys(n for s in steps for n in (s["pick"], s["place_on"])))
-  out = args.out or so101.PROJECT_ROOT / "videos" / f"sim_reality_l{args.level:g}_s{args.seed}.mp4"
+  out = args.out or so101.PROJECT_ROOT / "videos" / f"sim_reality_l{args.level:g}_s{args.seed}{'_kf' if args.tracker else ''}.mp4"
   out.parent.mkdir(parents=True, exist_ok=True)
 
   world = make_world(scene(args.scene), args.seed, args.level)
@@ -229,11 +242,15 @@ def main() -> None:
   ctrl = ReachController(ControllerCfg(speed_factor=args.speed), policy_dir=POLICY)
   arm = AgentArm(plant, ctrl, SafeTargets(), world.cfg.table_z)
   per = wrap_perception(SimPerception(world), args.seed, args.level, arm_points=arm.arm_points)
+  if args.tracker:
+    per = TrackedPerception(per, names, arm_points=arm.arm_points)
 
   sim_dt = world.substeps * world.model.opt.timestep  # 0.02 s per step_physics call
   every = max(1, int(round(args.playback / (sim_dt * args.fps))))
   title = ("Exact simulation (no noise)" if args.level <= 0 else
            f"Sim-to-real noise level {args.level:g}: servo noise + calib. bias, mass/friction, camera noise")
+  if args.tracker:
+    title = f"Sim-to-real noise level {args.level:g} + Kalman object tracker" if args.level > 0 else title + " + Kalman tracker"
   rec = Recorder(world, per, None if args.still else out, args.fps, every, args.level, title, tuple(args.view))
   if args.still:
     cv2.imwrite(str(args.still), rec.frame())
