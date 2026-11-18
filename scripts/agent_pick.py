@@ -42,9 +42,11 @@ def run_task(args, agent, arm, per, task: str, track: list[str], clear_view: boo
   if args.mode == "free":
     return agent.run(task, track)
   from so101_reach.agent.pipeline import Pipeline
+  from so101_reach.agent.skill_cache import SkillCache
 
+  cache = None if args.no_cache else (SkillCache(args.cache_dir) if args.cache_dir else SkillCache())
   steps = [{"pick": args.object, "place_on": args.place}] if (args.object and args.place and not args.task) else None
-  return Pipeline(agent, arm, per, clear_view=clear_view).run(task, track, steps)
+  return Pipeline(agent, arm, per, clear_view=clear_view, cache=cache, handoff=args.handoff).run(task, track, steps)
 
 
 def main() -> None:
@@ -69,6 +71,12 @@ def main() -> None:
   p.add_argument("--wrist-width", type=int, default=512, help="wrist image width sent to the model [px]")
   p.add_argument("--detail", default="high", choices=["low", "high", "auto"], help="image detail (low = cheapest)")
   p.add_argument("--speed", type=float, default=None, help="RL travel speed 0.05-1.0 (default: 0.3 real, 0.5 sim)")
+  p.add_argument("--handoff", default="local-first", choices=["local-first", "llm-only"],
+                 help="pipeline mode: local-first = cached/scripted grasp+place, LLM only on failure (default); "
+                      "llm-only = the LLM runs every grasp/place phase (A/B token baseline)")
+  p.add_argument("--no-cache", action="store_true", help="pipeline mode: do not read or write the skill cache")
+  p.add_argument("--cache-dir", type=Path, default=None,
+                 help="skill-cache directory (default: data/agent_cache)")
   p.add_argument("--yes", action="store_true", help="real arm: start without asking")
   args = p.parse_args()
   if args.task is None and args.object is None:

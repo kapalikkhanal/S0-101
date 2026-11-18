@@ -1,17 +1,21 @@
-"""Pipeline mode: code does the predictable parts, the agent only grasps and places.
+"""Pipeline mode: code does the predictable parts; the LLM is the fallback, not the default.
 
 For a task, an ordered list of pick-and-place steps (from --object/--place directly, or one
 planner call for free-text tasks such as stacking / unstacking). For each step:
 
   1. code   park the arm out of the head camera's view, measure the object and the target
   2. code   open the gripper to the object's width + 2 cm, rise, RL travel to 5 cm above the object
-  3. agent  GRASP phase (short prompt, fine-motion tools) - ends with done; code checks the
-            holding signal and retries from 1 (up to `grasp_retries`) if nothing is held
+  3. local  GRASP, zero tokens: cached parameters from an earlier LLM success if the skill cache
+            has a matching scene, else the scripted default (local_skills.py). Judged by the
+            holding signal. Only if that fails does the LLM run the GRASP phase (with the local
+            failure as context); a verified LLM grasp is distilled back into the cache.
   4. code   lift above everything nearby, RL travel to 5 cm above the target
-  5. agent  PLACE phase - decides drop / lower inside / stack from the object and the target, releases
+  5. local  PLACE, zero tokens: cached or scripted release (drop above rim / stack), verified by
+            re-perception; the LLM PLACE phase only on failure, successes distilled to the cache
   6. code   rise straight up
-and finally RL home. Works for any object the perception can measure: containers, surfaces and
-other objects (stacking) are all just "targets" with a measured top height.
+and finally RL home. `handoff="llm-only"` restores the old behaviour (LLM for every grasp/place)
+for A/B token comparisons. Works for any object the perception can measure: containers, surfaces
+and other objects (stacking) are all just "targets" with a measured top height.
 """
 
 from __future__ import annotations
@@ -22,7 +26,9 @@ import time
 import cv2
 import numpy as np
 
+from so101_reach.agent.local_skills import distill_grasp, distill_place, is_soft, jaw_for, scripted_grasp, scripted_place
 from so101_reach.agent.perception import Detection, annotate
+from so101_reach.agent.skill_cache import SkillCache, make_key
 
 GRASP_INSTRUCTIONS = """You control a 5-joint robot arm with a parallel-jaw gripper (units: cm, degrees; x forward,
 y left, h = height above the table). Positions refer to the GRIP POINT: midway between the jaw tips,
@@ -70,13 +76,18 @@ def _cm(v: float) -> float:
 
 class Pipeline:
   def __init__(self, agent, arm, per, grasp_retries: int = 2, grasp_turns: int = 10, place_turns: int = 6,
-               hover_cm: float = 5.0, clear_view: bool = True, log=print):
+               hover_cm: float = 5.0, clear_view: bool = True, log=print,
+               cache: SkillCache | None = None, handoff: str = "local-first"):
+    """handoff: "local-first" (cached/scripted fine motion first, LLM only on failure) or
+    "llm-only" (the LLM runs every grasp/place phase, the old behaviour)."""
     self.agent, self.arm, self.per = agent, arm, per
     self.grasp_retries, self.grasp_turns, self.place_turns = grasp_retries, grasp_turns, place_turns
     self.hover = hover_cm / 100
     self.use_clear_view = clear_view
     self.say = log
     self.tz = per.table_z
+    self.cache, self.handoff = cache, handoff
+    self.stats = {"llm_phases": 0, "local_phases": 0, "cache_hits": 0, "tokens_saved": 0}
 
   # --- perception helpers ------------------------------------------------------------------
   def _measure(self, names: list[str]) -> dict[str, Detection]:
@@ -131,20 +142,14 @@ class Pipeline:
     return r
 
   def _jaw_for(self, obj: Detection, width: float) -> float:
-    """Jaw closing direction square to the object's faces: across the narrow side of an elongated
-    object; for a square / round one, whichever face direction needs the smaller wrist turn
-    (closing diagonally on a square block catches only its corners and it slips out)."""
-    if max(obj.size[:2]) > 1.3 * width:
-      return obj.yaw_deg + 90
-    now = self.arm.state()["jaw_yaw_deg"]
-    cands = [obj.yaw_deg, obj.yaw_deg + 90]
-    return min(cands, key=lambda c: abs((c - now + 90) % 180 - 90))
+    return jaw_for(self.arm, obj, width)
 
   # --- one pick-and-place step -------------------------------------------------------------
   def step(self, k: int, pick: str, place_on: str, all_names: list[str]) -> dict:
     res = {"step": k, "pick": pick, "place_on": place_on, "grasp_attempts": 0}
     held_below = None
     obj = None
+    grasp_note = ""
     for attempt in range(self.grasp_retries + 1):
       res["grasp_attempts"] = attempt + 1
       dets = self._measure(all_names)
@@ -163,14 +168,36 @@ class Pipeline:
       self.say(f"  [pipeline] step {k} attempt {attempt + 1}: above {pick} -> {r}")
       if not r.startswith("ok"):
         return {**res, "result": r}
-      self.agent.phase = f"s{k}_grasp{attempt + 1}_"
-      task = (f"GRASP the {pick}. {obj.describe(self.tz)}. The grip point is now about {100 * self.hover:.0f} cm above its top; "
-              f"the gripper is open about {100 * (width + 0.02):.1f} cm.")
-      out = self.agent.run(task, [pick], GRASP_INSTRUCTIONS, FINE_TOOLS, self.grasp_turns,
-                           stop_when=lambda tool, res: tool == "close_gripper" and self.arm.state()["holding_signal"])
-      st = self.arm.state()
-      self.say(f"  [pipeline] grasp phase: agent says {out.get('success')} ({out.get('summary', '')[:80]}); holding={st['holding_signal']}")
-      if st["holding_signal"]:
+      gkey = make_key("grasp", pick, obj.size)
+      if self.handoff == "local-first" and attempt == 0:
+        # Zero-token rung: cached parameters from an earlier LLM success, else the scripted default.
+        entry = self.cache.lookup(gkey) if self.cache else None
+        self.agent.phase = f"s{k}_local{attempt + 1}_"
+        held, grasp_note = scripted_grasp(self.arm, obj, self.tz, entry["params"] if entry else None)
+        self.say(f"  [pipeline] grasp phase (local, 0 tokens): {grasp_note}")
+        if entry:
+          self.cache.hit(entry, held)
+          if held:
+            self.stats["cache_hits"] += 1
+            self.stats["tokens_saved"] += entry["stats"].get("tokens_phase", 0)
+        if held:
+          self.stats["local_phases"] += 1
+      else:
+        self.agent.phase = f"s{k}_grasp{attempt + 1}_"
+        task = (f"GRASP the {pick}. {obj.describe(self.tz)}. The grip point is now about {100 * self.hover:.0f} cm above its top; "
+                f"the gripper is open about {100 * (width + 0.02):.1f} cm."
+                + (f" A scripted grasp attempt just failed ({grasp_note}): try something different." if grasp_note else ""))
+        out = self.agent.run(task, [pick], GRASP_INSTRUCTIONS, FINE_TOOLS, self.grasp_turns,
+                             stop_when=lambda tool, res: tool == "close_gripper" and self.arm.state()["holding_signal"])
+        self.stats["llm_phases"] += 1
+        held = self.arm.state()["holding_signal"]
+        self.say(f"  [pipeline] grasp phase: agent says {out.get('success')} ({out.get('summary', '')[:80]}); holding={held}")
+        if held and self.cache is not None:
+          # The RL/local side learns from the LLM: distill the pose that worked into the cache.
+          e = self.cache.record(gkey, distill_grasp(self.arm, obj, self.agent.last_close_force),
+                                out.get("input_tokens", 0) + out.get("output_tokens", 0))
+          self.say(f"  [pipeline] cached grasp params for '{pick}': {e['params']}")
+      if held:
         gp = self.arm.geom(self.arm.q6()[0])["gp"]
         held_below = float(gp[2] - obj.support_z)
         self.arm.held = {"name": pick, "below_gp": held_below, "size": obj.size}
@@ -197,20 +224,41 @@ class Pipeline:
     container = bool(tgt.extra.get("container")) or max(tgt.size[:2]) > 1.8 * max(obj.size[:2])
     hint_drop = tgt.top_z - self.tz + 0.02 + held_below
     hint_stack = tgt.top_z - self.tz + 0.004 + held_below
-    self.agent.phase = f"s{k}_place_"
-    task = (f"PLACE the {pick} you are holding on/into the {place_on}.\n"
-            f"Held: {pick}, size {' x '.join(f'{100 * v:.1f}' for v in obj.size)} cm; its bottom is now at h={100 * bottom:.1f} cm "
-            f"({100 * held_below:.1f} cm below the grip point; grip point at h={100 * gp_h:.1f}).\n"
-            f"Target: {tgt.describe(self.tz)}" + (" (an open container)" if container else "") + ".\n"
-            f"Pre-computed grip-point heights: held bottom 2 cm above the target's top/rim -> h={100 * hint_drop:.1f} "
-            f"(from here: move_by dz={100 * (hint_drop - gp_h):+.1f}); held bottom 0.4 cm above the target's top (stacking) -> "
-            f"h={100 * hint_stack:.1f} (from here: move_by dz={100 * (hint_stack - gp_h):+.1f}).\n"
-            f"Opening the gripper releases the object and ends this phase.")
-    out = self.agent.run(task, [pick, place_on], PLACE_INSTRUCTIONS, PLACE_TOOLS, self.place_turns,
-                         stop_when=lambda tool, res: tool == "open_gripper" and not self.arm.state()["holding_signal"])
+    pkey = make_key("place", pick, obj.size, target_name=place_on, target_size=tgt.size, container=container)
+    released_by, place_note, out = None, "", {}
+    entry = None
+    if self.handoff == "local-first":
+      # Zero-token rung: cached release pose from an earlier LLM success, else the scripted rules.
+      entry = self.cache.lookup(pkey) if self.cache else None
+      self.agent.phase = f"s{k}_place_local_"
+      ok, place_note = scripted_place(self.arm, tgt, obj.size, held_below, self.tz, hint_drop, hint_stack,
+                                      container, is_soft(pick), entry["params"] if entry else None)
+      self.say(f"  [pipeline] place phase (local, 0 tokens): {place_note}")
+      if ok:
+        released_by = "cache" if entry else "scripted"
+        self.stats["local_phases"] += 1
+      elif entry:
+        self.cache.hit(entry, False)
+        entry = None
+    if released_by is None:
+      self.agent.phase = f"s{k}_place_"
+      task = (f"PLACE the {pick} you are holding on/into the {place_on}.\n"
+              f"Held: {pick}, size {' x '.join(f'{100 * v:.1f}' for v in obj.size)} cm; its bottom is now at h={100 * bottom:.1f} cm "
+              f"({100 * held_below:.1f} cm below the grip point; grip point at h={100 * gp_h:.1f}).\n"
+              f"Target: {tgt.describe(self.tz)}" + (" (an open container)" if container else "") + ".\n"
+              f"Pre-computed grip-point heights: held bottom 2 cm above the target's top/rim -> h={100 * hint_drop:.1f} "
+              f"(from here: move_by dz={100 * (hint_drop - gp_h):+.1f}); held bottom 0.4 cm above the target's top (stacking) -> "
+              f"h={100 * hint_stack:.1f} (from here: move_by dz={100 * (hint_stack - gp_h):+.1f}).\n"
+              + (f"A scripted place attempt just failed ({place_note}): try something different.\n" if place_note else "")
+              + "Opening the gripper releases the object and ends this phase.")
+      out = self.agent.run(task, [pick, place_on], PLACE_INSTRUCTIONS, PLACE_TOOLS, self.place_turns,
+                           stop_when=lambda tool, res: tool == "open_gripper" and not self.arm.state()["holding_signal"])
+      self.stats["llm_phases"] += 1
+      released_by = "llm"
     st = self.arm.state()
     if st["holding_signal"] or st["gripper_open_percent"] < 5:
       return {**res, "result": "place failed: object remains held"}
+    release_gp = self.arm.geom(self.arm.q6()[0])["gp"]  # the pose that released; distilled on success
     self.arm.held = None
     self._rise_to(self.tz + self.arm.state()["grip_point_cm"][2] / 100 + 0.04)
     # Release alone does not prove placement. Refresh geometry after settling.
@@ -219,7 +267,16 @@ class Pipeline:
     measured = [d for d in self.per.find(pick) if not d.extra.get("note")]
     verified = any(np.linalg.norm(d.center[:2] - tgt.center[:2]) < max(tgt.size[:2]) / 2
                    and d.support_z <= tgt.top_z + 0.015 for d in measured)
-    res["result"] = "placed" if out.get("success") and verified else "placement unverified"
+    if released_by == "cache" and entry is not None:
+      self.cache.hit(entry, verified)
+      if verified:
+        self.stats["cache_hits"] += 1
+        self.stats["tokens_saved"] += entry["stats"].get("tokens_phase", 0)
+    elif released_by == "llm" and verified and out.get("success") and self.cache is not None:
+      e = self.cache.record(pkey, distill_place(release_gp, tgt, held_below, self.agent.last_open_percent),
+                            out.get("input_tokens", 0) + out.get("output_tokens", 0))
+      self.say(f"  [pipeline] cached place params for '{pick}' on '{place_on}': {e['params']}")
+    res["result"] = "placed" if verified and (released_by != "llm" or out.get("success")) else "placement unverified"
     return res
 
   # --- whole task --------------------------------------------------------------------------
@@ -243,4 +300,11 @@ class Pipeline:
         break
     home = self.arm.home() if results and all(r["result"] == "placed" for r in results) else "skipped after failure"
     ok = len(results) == len(steps) and all(r["result"] == "placed" for r in results)
-    return {"success": ok, "steps": results, "home": home, "wall_s": round(time.time() - t0, 1)}
+    u = dict(self.agent.total_usage)
+    self.say(f"  [pipeline] handoff {self.handoff}: {self.stats['llm_phases']} LLM phase(s), "
+             f"{self.stats['local_phases']} local ({self.stats['cache_hits']} cache hit(s)); "
+             f"tokens in {u['in']:,} / out {u['out']:,}; ~{self.stats['tokens_saved']:,} tokens saved by the cache"
+             + (f"; {self.cache.summary()} in {self.cache.path}" if self.cache else ""))
+    return {"success": ok, "steps": results, "home": home, "wall_s": round(time.time() - t0, 1),
+            "handoff": self.handoff, "phases": dict(self.stats), "tokens": u,
+            "tokens_saved_estimate": self.stats["tokens_saved"]}

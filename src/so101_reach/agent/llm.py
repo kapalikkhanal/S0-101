@@ -193,6 +193,9 @@ class Agent:
     self.tracked: list[str] = []
     self.dets: list[Detection] = []
     self.events: list[dict] = []
+    self.total_usage = {"in": 0, "out": 0, "cached": 0}  # summed over all run()/plan() calls
+    self.last_close_force = "firm"  # last close_gripper force / open_gripper percent the model
+    self.last_open_percent = 60.0  # chose (read when distilling a success into the skill cache)
 
   def _say(self, msg: str) -> None:
     if self.verbose:
@@ -280,8 +283,10 @@ class Agent:
     if name == "set_orientation":
       return a.set_orientation(args.get("tilt"), args.get("jaw_yaw"))
     if name == "open_gripper":
+      self.last_open_percent = float(args["percent"])
       return a.gripper(args["percent"], "medium")
     if name == "close_gripper":
+      self.last_close_force = args["force"]
       out = a.gripper(0, args["force"])
       if out.startswith("closed on something"):
         self._note_held()
@@ -385,6 +390,9 @@ class Agent:
     return self._finish(result, t_start, usage)
 
   def _finish(self, result: dict, t_start: float, usage: dict) -> dict:
+    self.total_usage["in"] += usage["in"]
+    self.total_usage["out"] += usage["out"]
+    self.total_usage["cached"] += usage.get("cached", 0)
     result.update(wall_s=round(time.time() - t_start, 1), input_tokens=usage["in"], cached_input_tokens=usage.get("cached", 0),
                   output_tokens=usage["out"], log=str(self.log_dir))
     self._say(f"  [cost] {result.get('turns', 0)} turns, input {usage['in']:,} tokens ({usage.get('cached', 0):,} cached), "
@@ -410,6 +418,9 @@ class Agent:
         content.append({"type": "input_image", "image_url": f"data:image/jpeg;base64,{image_b64}", "detail": self.detail})
       r = self.client.responses.create(model=self.model, input=[{"role": "user", "content": content}], tools=[tool],
                                        tool_choice={"type": "function", "name": "submit_plan"}, reasoning={"effort": self.effort})
+      if r.usage is not None:
+        self.total_usage["in"] += r.usage.input_tokens
+        self.total_usage["out"] += r.usage.output_tokens
       calls = [o for o in r.output if o.type == "function_call"]
       args = json.loads(calls[0].arguments) if calls else {"steps": []}
     else:
@@ -420,6 +431,9 @@ class Agent:
       extra = {"think": False} if self.effort == "none" else {"reasoning_effort": self.effort}
       r = self.client.chat.completions.create(model=self.model, messages=[{"role": "user", "content": content}], tools=[ctool],
                                               tool_choice="auto", temperature=0.2, max_tokens=4096, extra_body=extra)
+      if getattr(r, "usage", None) is not None:
+        self.total_usage["in"] += r.usage.prompt_tokens or 0
+        self.total_usage["out"] += r.usage.completion_tokens or 0
       m = r.choices[0].message
       calls = list(m.tool_calls or []) or _calls_from_text(m.content or "", 0, {"submit_plan"})
       args = json.loads(calls[0].function.arguments) if calls else {"steps": []}

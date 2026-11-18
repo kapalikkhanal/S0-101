@@ -90,8 +90,12 @@ python scripts/ai_agent.py --sim stack \
 
 Simulation is the default. Choose `--model` for a vision/tool-capable model available to
 your API account; the default can be overridden with `SO101_OPENAI_MODEL`.
-`--mode pipeline` measures and travels in code, with model-guided grasp/place;
-`--mode free` lets the model choose each action. `--max-turns 30` bounds turns and
+`--mode pipeline` measures and travels in code; grasp/place first run locally for zero
+tokens (parameters cached from earlier model successes in `data/agent_cache/skills.json`,
+else a scripted default), and the model is called only when the local attempt fails its
+hardware check - verified model recoveries are distilled back into the cache.
+`--handoff llm-only` restores model-guided grasp/place for every phase (token baseline),
+`--no-cache` disables the cache. `--mode free` lets the model choose each action. `--max-turns 30` bounds turns and
 `--max-input-tokens 300000` bounds cumulative input tokens; these are not dollar caps.
 Simulation uses ground-truth object detections plus rendered images, so success there
 does not validate real-camera perception. Logs/images stay under ignored `logs/`.
